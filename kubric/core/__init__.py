@@ -22,3 +22,4 @@ from .objects import *
 from .materials import *
 from .lights import *
 from .cameras import *
+from .animation import *

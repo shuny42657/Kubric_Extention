@@ -110,7 +110,8 @@ class Blender(core.View):
 
     self.use_gpu = os.getenv("KUBRIC_USE_GPU", "False").lower() in ("true", "1", "t")
 
-    blender_utils.activate_render_passes(normal=False, optical_flow=False, segmentation=False, uv=False)
+    blender_utils.activate_render_passes(
+        normal=True, optical_flow=True, segmentation=True, uv=True)
     self._setup_scene_shading()
 
     self.adaptive_sampling = adaptive_sampling  # speeds up rendering
@@ -200,13 +201,32 @@ class Blender(core.View):
 
   @use_gpu.setter
   def use_gpu(self, value: bool):
-    self.blender_scene.cycles.device = "GPU" if value else "CPU"
-    if value:
-      # call get_devices() to let Blender detect GPU devices
-      bpy.context.preferences.addons["cycles"].preferences.get_devices()
-      devices_used = [d.name for d in bpy.context.preferences.addons["cycles"].preferences.devices
-                      if d.use]
-      logger.info("Using the following GPU Device(s): %s", devices_used)
+    if not value:
+      self.blender_scene.cycles.device = "CPU"
+      return
+
+    backend = os.getenv("KUBRIC_CYCLES_BACKEND", "CUDA").upper()
+    preferences = bpy.context.preferences.addons["cycles"].preferences
+    try:
+      preferences.compute_device_type = backend
+    except TypeError as exc:
+      raise RuntimeError(
+          f"Cycles backend {backend!r} is not available in this Blender build") from exc
+
+    preferences.get_devices()
+    gpu_devices = [device for device in preferences.devices
+                   if device.type == backend]
+    if not gpu_devices:
+      available_devices = [(device.name, device.type)
+                           for device in preferences.devices]
+      raise RuntimeError(
+          f"Cycles found no {backend} device. Available devices: {available_devices}")
+
+    for device in preferences.devices:
+      device.use = device in gpu_devices
+    self.blender_scene.cycles.device = "GPU"
+    logger.info("Using the following GPU Device(s): %s",
+                [device.name for device in gpu_devices])
 
   def set_exr_output_path(self, path_prefix: Optional[PathLike]):
     """Set the target path prefix for EXR output.
@@ -392,6 +412,93 @@ class Blender(core.View):
       except ReferenceError:
         pass  # In this case the object is already gone
 
+  def get_mesh_vertices(self, asset: core.PhysicalObject) -> np.ndarray:
+    """Returns an asset's imported render-mesh vertices in local coordinates."""
+    blender_obj = asset.linked_objects.get(self)
+    if blender_obj is None:
+      raise ValueError(f"Asset {asset.uid!r} is not linked to this renderer")
+    if blender_obj.type != "MESH":
+      raise ValueError(
+          f"Asset {asset.uid!r} must map to one Blender mesh, got {blender_obj.type!r}")
+
+    vertices = np.empty(len(blender_obj.data.vertices) * 3, dtype=np.float32)
+    blender_obj.data.vertices.foreach_get("co", vertices)
+    return vertices.reshape((-1, 3))
+
+  def get_mesh_geometry(
+      self, asset: core.PhysicalObject
+  ) -> tuple[np.ndarray, np.ndarray]:
+    """Returns local vertices and triangulated faces of an imported render mesh."""
+    blender_obj = asset.linked_objects.get(self)
+    if blender_obj is None:
+      raise ValueError(f"Asset {asset.uid!r} is not linked to this renderer")
+    if blender_obj.type != "MESH":
+      raise ValueError(
+          f"Asset {asset.uid!r} must map to one Blender mesh, got {blender_obj.type!r}")
+
+    vertices = self.get_mesh_vertices(asset)
+    blender_obj.data.calc_loop_triangles()
+    faces = np.asarray([
+        tuple(triangle.vertices)
+        for triangle in blender_obj.data.loop_triangles
+    ], dtype=np.int64)
+    if faces.size == 0:
+      raise ValueError(f"Asset {asset.uid!r} has no render-mesh faces")
+    return vertices, faces
+
+  def add_vertex_animation(
+      self,
+      asset: core.PhysicalObject,
+      animation: core.VertexAnimation,
+  ) -> None:
+    """Applies a world-space vertex animation to an asset's render mesh."""
+    if animation.asset is not asset:
+      raise ValueError("animation.asset must be the asset being animated")
+    if animation.coordinate_space != "world":
+      raise ValueError("Blender only accepts world-space vertex animations")
+
+    blender_obj = asset.linked_objects.get(self)
+    if blender_obj is None:
+      raise ValueError(f"Asset {asset.uid!r} is not linked to this renderer")
+    if blender_obj.type != "MESH":
+      raise ValueError(
+          f"Asset {asset.uid!r} must map to one Blender mesh, got {blender_obj.type!r}")
+    if len(blender_obj.data.vertices) != animation.num_vertices:
+      raise ValueError(
+          f"Vertex count mismatch for {asset.uid!r}: render mesh has "
+          f"{len(blender_obj.data.vertices)}, animation has {animation.num_vertices}")
+    if blender_obj.data.shape_keys is not None:
+      raise ValueError(
+          f"Asset {asset.uid!r} already has shape keys; replacing them is not supported")
+
+    _clear_object_transform_animation(blender_obj)
+    blender_obj.location = (0., 0., 0.)
+    blender_obj.rotation_quaternion = (1., 0., 0., 0.)
+    blender_obj.scale = (1., 1., 1.)
+
+    basis = blender_obj.shape_key_add(name="Basis", from_mix=False)
+    basis.data.foreach_set("co", animation.vertices[0].reshape(-1))
+
+    for frame_offset, frame_vertices in enumerate(animation.vertices):
+      frame = animation.frame_start + frame_offset
+      shape_key = blender_obj.shape_key_add(
+          name=f"VertexAnimation_{frame}", from_mix=False)
+      shape_key.data.foreach_set("co", frame_vertices.reshape(-1))
+      shape_key.value = 0.
+      shape_key.keyframe_insert(data_path="value", frame=frame - 1)
+      shape_key.value = 1.
+      shape_key.keyframe_insert(data_path="value", frame=frame)
+      shape_key.value = 0.
+      shape_key.keyframe_insert(data_path="value", frame=frame + 1)
+
+    shape_key_action = blender_obj.data.shape_keys.animation_data.action
+    for fcurve in shape_key_action.fcurves:
+      for keyframe in fcurve.keyframe_points:
+        keyframe.interpolation = "LINEAR"
+
+    blender_obj.data.update()
+    self.blender_scene.frame_set(self.blender_scene.frame_current)
+
   @add_asset.register(core.Cube)
   @blender_utils.prepare_blender_object
   def _add_asset(self, asset: core.Cube):
@@ -429,9 +536,14 @@ class Blender(core.View):
       with io.StringIO() as fstdout:  # < scratch stdout buffer
         with redirect_stdout(fstdout):  # < also suppresses python stdout
           if extension == "obj":
-            bpy.ops.wm.obj_import(filepath=obj.render_filename,
-                                     use_split_objects=False,
-                                     **obj.render_import_kwargs)
+            if bpy.app.version >= (4, 0, 0):
+              bpy.ops.wm.obj_import(filepath=obj.render_filename,
+                                    use_split_objects=False,
+                                    **obj.render_import_kwargs)
+            else:
+              bpy.ops.import_scene.obj(filepath=obj.render_filename,
+                                       use_split_objects=False,
+                                       **obj.render_import_kwargs)
           elif extension in ["glb", "gltf"]:
             bpy.ops.import_scene.gltf(filepath=obj.render_filename,
                                       **obj.render_import_kwargs)
@@ -626,31 +738,40 @@ class Blender(core.View):
     mat.use_nodes = True
     bsdf_node = mat.node_tree.nodes["Principled BSDF"]
 
-    obj.observe(AttributeSetter(bsdf_node.inputs["Base Color"], "default_value"), "color")
-    obj.observe(KeyframeSetter(bsdf_node.inputs["Base Color"], "default_value"), "color",
-                type="keyframe")
-    obj.observe(AttributeSetter(bsdf_node.inputs["Roughness"], "default_value"), "roughness")
-    obj.observe(KeyframeSetter(bsdf_node.inputs["Roughness"], "default_value"), "roughness",
-                type="keyframe")
-    obj.observe(AttributeSetter(bsdf_node.inputs["Metallic"], "default_value"), "metallic")
-    obj.observe(KeyframeSetter(bsdf_node.inputs["Metallic"], "default_value"), "metallic",
-                type="keyframe")
-    obj.observe(AttributeSetter(bsdf_node.inputs["Specular IOR Level"], "default_value"), "specular")
-    obj.observe(KeyframeSetter(bsdf_node.inputs["Specular IOR Level"], "default_value"), "specular",
-                type="keyframe")
-    obj.observe(AttributeSetter(bsdf_node.inputs["Specular Tint"],
-                                "default_value"), "specular_tint")
-    obj.observe(KeyframeSetter(bsdf_node.inputs["Specular Tint"], "default_value"), "specular_tint",
-                type="keyframe")
-    obj.observe(AttributeSetter(bsdf_node.inputs["IOR"], "default_value"), "ior")
-    obj.observe(KeyframeSetter(bsdf_node.inputs["IOR"], "default_value"), "ior",
-                type="keyframe")
-    obj.observe(AttributeSetter(bsdf_node.inputs["Transmission Weight"], "default_value"), "transmission")
-    obj.observe(KeyframeSetter(bsdf_node.inputs["Transmission Weight"], "default_value"), "transmission",
-                type="keyframe")
-    obj.observe(AttributeSetter(bsdf_node.inputs["Emission Color"], "default_value"), "emission")
-    obj.observe(KeyframeSetter(bsdf_node.inputs["Emission Color"], "default_value"), "emission",
-                type="keyframe")
+    def observe_input(trait_name, *input_names, converter=None, required=True):
+      node_input = next(
+          (bsdf_node.inputs.get(name) for name in input_names
+           if bsdf_node.inputs.get(name) is not None),
+          None)
+      if node_input is None:
+        if required:
+          raise KeyError(
+              f"None of {input_names!r} exists on the Principled BSDF node")
+        return
+      obj.observe(
+          AttributeSetter(node_input, "default_value", converter=converter),
+          trait_name)
+      obj.observe(
+          KeyframeSetter(node_input, "default_value"), trait_name,
+          type="keyframe")
+
+    observe_input("color", "Base Color")
+    observe_input("roughness", "Roughness")
+    observe_input("metallic", "Metallic")
+    observe_input("specular", "Specular IOR Level", "Specular")
+
+    specular_tint_input = bsdf_node.inputs.get("Specular Tint")
+    specular_tint_converter = None
+    if specular_tint_input is not None and specular_tint_input.type == "VALUE":
+      specular_tint_converter = lambda value: float(np.mean(np.asarray(value)[:3]))
+    observe_input(
+        "specular_tint", "Specular Tint", converter=specular_tint_converter)
+
+    observe_input("ior", "IOR")
+    observe_input("transmission", "Transmission Weight", "Transmission")
+    observe_input(
+        "transmission_roughness", "Transmission Roughness", required=False)
+    observe_input("emission", "Emission Color", "Emission")
     return mat
 
   @add_asset.register(core.FlatMaterial)
@@ -810,6 +931,16 @@ class KeyframeSetter:
 
   def __call__(self, change):
     self.blender_obj.keyframe_insert(self.attribute_path, frame=change.frame)
+
+
+def _clear_object_transform_animation(blender_obj):
+  """Removes object-space animation superseded by world-space vertices."""
+  if blender_obj.animation_data is None or blender_obj.animation_data.action is None:
+    return
+  action = blender_obj.animation_data.action
+  for fcurve in list(action.fcurves):
+    if fcurve.data_path in {"location", "rotation_quaternion", "scale"}:
+      action.fcurves.remove(fcurve)
 
 
 def register_object3d_setters(obj, blender_obj):

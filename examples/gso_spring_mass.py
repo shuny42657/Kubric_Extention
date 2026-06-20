@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Drops one Google Scanned Object onto a floor and renders the simulation."""
+"""Fills a GSO mesh, simulates it with GPU springs, and renders deformation."""
 
 import logging
 
@@ -20,8 +20,8 @@ import numpy as np
 
 import kubric as kb
 from kubric.renderer import Blender
-from kubric.simulator import PyBullet
-from kubric.simulator import rigid_body_to_vertex_animation
+from kubric.simulator import SpringMassConfig
+from kubric.simulator import SpringMassSimulator
 
 
 parser = kb.ArgumentParser()
@@ -29,42 +29,54 @@ parser.add_argument(
     "--gso_assets",
     type=str,
     default="gs://kubric-public/assets/GSO/GSO.json",
-    help="Path to the GSO asset manifest.",
 )
-parser.add_argument(
-    "--asset_id",
-    type=str,
-    default=None,
-    help="GSO asset ID. A random asset is selected when omitted.",
+parser.add_argument("--asset_id", type=str, default=None)
+parser.add_argument("--particle_spacing", type=float, default=0.1)
+parser.add_argument("--k_neighbors", type=int, default=16)
+parser.add_argument("--spring_stiffness", type=float, default=200.0)
+parser.add_argument("--damping", type=float, default=0.5)
+parser.set_defaults(
+    frame_end=24,
+    frame_rate=24,
+    step_rate=240,
+    resolution="256x256",
+    seed=42,
 )
-parser.set_defaults(frame_end=24, frame_rate=24, resolution="256x256", seed=42)
 FLAGS = parser.parse_args()
 
 
 scene, rng, output_dir, scratch_dir = kb.setup(FLAGS)
-simulator = PyBullet(scene, scratch_dir)
 renderer = Blender(scene, scratch_dir, samples_per_pixel=64, use_denoising=True)
+simulator = SpringMassSimulator(
+    scene,
+    config=SpringMassConfig(
+        particle_spacing=FLAGS.particle_spacing,
+        k_neighbors=FLAGS.k_neighbors,
+        spring_stiffness=FLAGS.spring_stiffness,
+        damping=FLAGS.damping,
+        total_mass=1.0,
+        initial_velocity=(0.5, 0., 0.),
+        ground_axis=2,
+        ground_height=0.,
+        restitution=0.2,
+        friction=0.3,
+        seed=FLAGS.seed,
+    ),
+    device="cuda",
+)
 
-# The cube's top surface is at z=0.
 floor = kb.Cube(
     name="floor",
-    scale=(3, 3, 0.1),
-    position=(0, 0, -0.1),
+    scale=(3., 3., 0.1),
+    position=(0., 0., -0.1),
     static=True,
-    friction=0.8,
-    restitution=0.1,
     material=kb.PrincipledBSDFMaterial(color=kb.Color(0.3, 0.3, 0.3)),
 )
 scene.add(floor)
-
-scene.camera = kb.PerspectiveCamera(position=(4, -6, 3.5))
-scene.camera.look_at((0, 0, 1))
+scene.camera = kb.PerspectiveCamera(position=(3.2, -4.8, 3.0))
+scene.camera.look_at((0., 0., 1.))
 scene.add(kb.DirectionalLight(
-    name="sun",
-    position=(-3, -4, 6),
-    look_at=(0, 0, 0),
-    intensity=2.0,
-))
+    name="sun", position=(-3., -4., 6.), look_at=(0., 0., 0.), intensity=2.0))
 scene.ambient_illumination = kb.Color(0.1, 0.1, 0.1)
 
 with kb.AssetSource.from_manifest(FLAGS.gso_assets, scratch_dir) as gso:
@@ -72,38 +84,34 @@ with kb.AssetSource.from_manifest(FLAGS.gso_assets, scratch_dir) as gso:
   asset_id = FLAGS.asset_id or rng.choice(asset_ids)
   if asset_id not in gso._assets:  # pylint: disable=protected-access
     raise ValueError(f"Unknown GSO asset ID: {asset_id!r}")
-  logging.info("Using GSO asset '%s'", asset_id)
-  obj = gso.create(asset_id=asset_id)
 
-  # Normalize the largest object dimension to one scene unit while preserving
-  # the same uniform scale in Blender and PyBullet.
+  logging.info("Using GSO asset %r", asset_id)
+  obj = gso.create(asset_id=asset_id)
   bounds = np.asarray(obj.bounds)
   scale = 1.0 / np.max(bounds[1] - bounds[0])
   obj.scale = (scale, scale, scale)
-  obj.position = (0, 0, 2.5)
+  obj.position = (0., 0., 1.5)
   obj.quaternion = kb.random_rotation(rng=rng)
-  obj.velocity = (0.5, 0, 0)
-  obj.angular_velocity = (1, 2, 1)
-  obj.friction = 0.5
-  obj.restitution = 0.3
   scene.add(obj)
 
-  logging.info("Running rigid-body simulation ...")
-  pose_animations, collisions = simulator.run(
-      frame_start=0, frame_end=scene.frame_end + 1)
-  vertex_animation = rigid_body_to_vertex_animation(
+  vertices, faces = renderer.get_mesh_geometry(obj)
+  vertex_animation = simulator.run(
       asset=obj,
-      rest_vertices=renderer.get_mesh_vertices(obj),
-      pose_animation=pose_animations[obj],
+      vertices=vertices,
+      faces=faces,
       frame_start=0,
+      frame_end=scene.frame_end + 1,
   )
   renderer.add_vertex_animation(obj, vertex_animation)
 
-  renderer.save_state(output_dir / "gso_rigidbody.blend")
-  logging.info("Rendering frames to '%s' ...", output_dir)
+  logging.info(
+      "Spring graph contains %d particles and %d edges",
+      len(simulator.last_initial_particles), len(simulator.last_edges))
+  renderer.save_state(output_dir / "gso_spring_mass.blend")
   frames = renderer.render(return_layers=("rgba",))
   kb.write_image_dict({"rgba": frames["rgba"]}, output_dir)
   kb.write_json({
       "asset_id": asset_id,
-      "collisions": kb.process_collisions(collisions, scene),
+      "num_particles": len(simulator.last_initial_particles),
+      "num_springs": len(simulator.last_edges),
   }, output_dir / "metadata.json")

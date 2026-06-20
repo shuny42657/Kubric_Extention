@@ -16,3 +16,5 @@ shapenet2kubric/shapenet2kubric.log
 examples/KuBasic/Cone/*
 Dockerfile
 output_tmp/*
+output
+Spring-Gaus
