@@ -19,6 +19,7 @@ import pytest
 
 import kubric as kb
 from kubric.simulator.spring_mass import fill_mesh_with_particles
+from kubric.simulator.spring_mass import RepeatedLiftConfig
 from kubric.simulator.spring_mass import SpringMassConfig
 from kubric.simulator.spring_mass import SpringMassSimulator
 
@@ -118,3 +119,84 @@ def test_spring_mass_returns_vertex_animation_on_cpu():
       animation.vertices[0], TETRAHEDRON_VERTICES + (0., 0., 2.), atol=1e-6)
   assert np.all(animation.vertices[1, :, 2] < animation.vertices[0, :, 2])
   assert simulator.last_edges.shape[1] == 2
+
+
+def test_spring_mass_repeatedly_lifts_one_control_vertex():
+  pytest.importorskip("torch")
+  scene = kb.Scene(
+      frame_start=0,
+      frame_end=11,
+      frame_rate=10,
+      step_rate=100,
+      gravity=(0., 0., -5.),
+  )
+  asset = kb.FileBasedObject(
+      asset_id="controlled-tetrahedron",
+      position=(0.5, 0.25, 2.),
+      mass=1.,
+      friction=0.,
+      restitution=0.,
+  )
+  simulator = SpringMassSimulator(
+      scene,
+      config=SpringMassConfig(
+          particle_spacing=0.3,
+          surface_sample_spacing=0.4,
+          k_neighbors=3,
+          spring_stiffness=20.,
+          damping=0.1,
+          ground_axis=2,
+          ground_height=0.,
+          max_particles=1000,
+          seed=3,
+      ),
+      device="cpu",
+  )
+
+  animation = simulator.run(
+      asset,
+      TETRAHEDRON_VERTICES,
+      TETRAHEDRON_FACES,
+      repeated_lift=RepeatedLiftConfig(
+          control_vertex_index=0,
+          repeat_count=2,
+          initial_settle_seconds=0.1,
+          lift_seconds=0.2,
+          hold_seconds=0.1,
+          settle_seconds=0.2,
+      ),
+  )
+
+  control_heights = animation.vertices[:, 0, 2]
+  np.testing.assert_allclose(control_heights[[3, 8]], 2., atol=1e-5)
+  np.testing.assert_allclose(animation.vertices[[3, 8], 0, :2], 0., atol=1e-5)
+  assert control_heights[5] < control_heights[3]
+  np.testing.assert_allclose(
+      animation.vertices[3, 0], animation.vertices[4, 0], atol=1e-5)
+  assert not np.allclose(animation.vertices[3, 1:], animation.vertices[4, 1:])
+  assert simulator.last_control_particle_index == 0
+
+
+def test_spring_mass_rejects_out_of_range_control_vertex():
+  pytest.importorskip("torch")
+  scene = kb.Scene(frame_start=0, frame_end=1, frame_rate=10, step_rate=100)
+  asset = kb.FileBasedObject(asset_id="tetrahedron", mass=1.)
+  simulator = SpringMassSimulator(
+      scene,
+      config=SpringMassConfig(
+          particle_spacing=0.3,
+          surface_sample_spacing=0.4,
+          k_neighbors=3,
+          ground_axis=None,
+          max_particles=1000,
+      ),
+      device="cpu",
+  )
+
+  with pytest.raises(ValueError, match="outside the render mesh"):
+    simulator.run(
+        asset,
+        TETRAHEDRON_VERTICES,
+        TETRAHEDRON_FACES,
+        repeated_lift=RepeatedLiftConfig(control_vertex_index=4),
+    )

@@ -73,6 +73,8 @@ class _NumpyEncoder(json.JSONEncoder):
   def default(self, o):
     if isinstance(o, np.ndarray):
       return o.tolist()
+    if isinstance(o, np.generic):
+      return o.item()
     return json.JSONEncoder.default(self, o)
 
 

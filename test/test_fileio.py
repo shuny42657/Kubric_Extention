@@ -18,6 +18,25 @@ import pytest
 from kubric import file_io
 
 
+def test_write_json_supports_numpy_scalars(tmpdir):
+  filename = tmpdir / "numpy_scalars.json"
+  data = {
+      "float32": np.float32(1.25),
+      "int64": np.int64(7),
+      "bool": np.bool_(True),
+      "array": np.asarray([1., 2.], dtype=np.float32),
+  }
+
+  file_io.write_json(data, filename)
+
+  assert file_io.read_json(filename) == {
+      "float32": 1.25,
+      "int64": 7,
+      "bool": True,
+      "array": [1., 2.],
+  }
+
+
 def test_write_read_grayscale_uint8_png(tmpdir):
   filename = tmpdir / "grayscale_uint8.png"
   img_data = np.arange(256, dtype=np.uint8).reshape((16, 16, 1))

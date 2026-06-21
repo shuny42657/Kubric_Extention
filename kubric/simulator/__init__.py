@@ -14,5 +14,6 @@
 
 from kubric.simulator.pybullet import PyBullet
 from kubric.simulator.rigid_body import rigid_body_to_vertex_animation
+from kubric.simulator.spring_mass import RepeatedLiftConfig
 from kubric.simulator.spring_mass import SpringMassConfig
 from kubric.simulator.spring_mass import SpringMassSimulator
