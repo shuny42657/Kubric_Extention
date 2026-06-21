@@ -89,6 +89,51 @@ class SpringMassConfig:
         raise ValueError(f"{name} must be between zero and one")
 
 
+@dataclass(frozen=True)
+class RepeatedLiftConfig:
+  """Schedule for repeatedly lifting and releasing one surface vertex.
+
+  The control point is the welded simulation particle corresponding to
+  `control_vertex_index` in the input render mesh. If `target_height` is not
+  specified, it is lifted back to its height at the start of the simulation.
+  `target_horizontal` gives the target coordinates on the other two axes.
+  """
+
+  control_vertex_index: int
+  repeat_count: int = 5
+  initial_settle_seconds: float = 2.0
+  lift_seconds: float = 1.0
+  hold_seconds: float = 0.2
+  settle_seconds: float = 2.0
+  target_height: Optional[float] = None
+  target_horizontal: Tuple[float, float] = (0., 0.)
+  vertical_axis: int = 2
+
+  def __post_init__(self):
+    if self.control_vertex_index < 0:
+      raise ValueError("control_vertex_index cannot be negative")
+    if self.repeat_count <= 0:
+      raise ValueError("repeat_count must be positive")
+    durations = (
+        self.initial_settle_seconds, self.lift_seconds, self.hold_seconds,
+        self.settle_seconds)
+    if not all(np.isfinite(duration) for duration in durations):
+      raise ValueError("lift schedule durations must be finite")
+    if self.initial_settle_seconds < 0 or self.hold_seconds < 0:
+      raise ValueError("initial settle and hold durations cannot be negative")
+    if self.lift_seconds <= 0:
+      raise ValueError("lift_seconds must be positive")
+    if self.settle_seconds < 0:
+      raise ValueError("settle_seconds cannot be negative")
+    if self.vertical_axis not in (0, 1, 2):
+      raise ValueError("vertical_axis must be 0, 1, or 2")
+    if self.target_height is not None and not np.isfinite(self.target_height):
+      raise ValueError("target_height must be finite")
+    if (len(self.target_horizontal) != 2 or
+        not all(np.isfinite(value) for value in self.target_horizontal)):
+      raise ValueError("target_horizontal must contain two finite values")
+
+
 class SpringMassSimulator:
   """Simulates a filled triangle mesh as particles connected by springs.
 
@@ -117,6 +162,7 @@ class SpringMassSimulator:
     self.last_initial_particles = None
     self.last_edges = None
     self.last_particle_trajectory = None
+    self.last_control_particle_index = None
 
   def run(
       self,
@@ -125,6 +171,7 @@ class SpringMassSimulator:
       faces: np.ndarray,
       frame_start: Optional[int] = None,
       frame_end: Optional[int] = None,
+      repeated_lift: Optional[RepeatedLiftConfig] = None,
   ) -> core.VertexAnimation:
     """Runs the simulation and returns world-space render-mesh vertices.
 
@@ -134,6 +181,7 @@ class SpringMassSimulator:
       faces: Triangular render mesh faces indexing `vertices`.
       frame_start: First recorded frame, inclusive.
       frame_end: Last recorded frame, inclusive.
+      repeated_lift: Optional repeated lift-and-release schedule.
     """
     if not isinstance(asset, core.PhysicalObject):
       raise TypeError("asset must be a PhysicalObject")
@@ -180,6 +228,21 @@ class SpringMassSimulator:
                    else self.config.restitution)
     friction = asset.friction if self.config.friction is None else self.config.friction
 
+    lift_controller = None
+    self.last_control_particle_index = None
+    if repeated_lift is not None:
+      if repeated_lift.control_vertex_index >= len(vertices):
+        raise ValueError(
+            "control_vertex_index is outside the render mesh vertex range")
+      control_particle_index = int(
+          surface_mapping[repeated_lift.control_vertex_index])
+      lift_controller = _RepeatedLiftController(
+          config=repeated_lift,
+          particle_index=control_particle_index,
+          initial_position=positions[control_particle_index].clone(),
+      )
+      self.last_control_particle_index = control_particle_index
+
     render_trajectory = []
     particle_trajectory = [] if self.config.record_all_particles else None
     surface_mapping_tensor = torch.as_tensor(
@@ -213,6 +276,8 @@ class SpringMassSimulator:
           _apply_ground_collision(
               positions, velocities, self.config.ground_axis,
               self.config.ground_height, restitution, friction)
+          if lift_controller is not None:
+            lift_controller.advance(positions, velocities, dt)
 
         if not torch.isfinite(positions).all():
           raise RuntimeError(
@@ -233,6 +298,95 @@ class SpringMassSimulator:
         frame_start=frame_start,
         vertices=np.stack(render_trajectory).astype(np.float32),
     )
+
+
+class _RepeatedLiftController:
+  """Applies a kinematic constraint to one particle on a timed schedule."""
+
+  def __init__(self, config, particle_index, initial_position):
+    self.config = config
+    self.particle_index = particle_index
+    self.target_height = (
+        float(initial_position[config.vertical_axis])
+        if config.target_height is None else float(config.target_height))
+    self.phase = "initial_settle"
+    self.phase_elapsed = 0.0
+    self.completed_lifts = 0
+    self.lift_start = None
+    self.lift_target = None
+    self.previous_target = None
+    if config.initial_settle_seconds == 0:
+      self.phase = "lift"
+      self._set_lift_start(initial_position)
+
+  def advance(self, positions, velocities, dt):
+    if self.phase == "done":
+      return
+
+    if self.phase == "initial_settle":
+      self.phase_elapsed += dt
+      if self._duration_reached(self.config.initial_settle_seconds):
+        self._begin_lift(positions)
+      return
+
+    if self.phase == "lift":
+      if self.lift_start is None:
+        self._capture_lift_start(positions)
+      self.phase_elapsed = min(
+          self.phase_elapsed + dt, self.config.lift_seconds)
+      progress = self.phase_elapsed / self.config.lift_seconds
+      smooth_progress = progress * progress * (3.0 - 2.0 * progress)
+      target = self.lift_start + (
+          self.lift_target - self.lift_start) * smooth_progress
+      self._constrain(positions, velocities, target, dt)
+      if self._duration_reached(self.config.lift_seconds):
+        self.phase = "hold"
+        self.phase_elapsed = 0.0
+      return
+
+    if self.phase == "hold":
+      positions[self.particle_index] = self.previous_target
+      velocities[self.particle_index].zero_()
+      self.phase_elapsed += dt
+      if self._duration_reached(self.config.hold_seconds):
+        self.completed_lifts += 1
+        self.phase = "settle"
+        self.phase_elapsed = 0.0
+      return
+
+    if self.phase == "settle":
+      self.phase_elapsed += dt
+      if self._duration_reached(self.config.settle_seconds):
+        if self.completed_lifts >= self.config.repeat_count:
+          self.phase = "done"
+        else:
+          self._begin_lift(positions)
+
+  def _begin_lift(self, positions):
+    self.phase = "lift"
+    self.phase_elapsed = 0.0
+    self._capture_lift_start(positions)
+
+  def _capture_lift_start(self, positions):
+    self._set_lift_start(positions[self.particle_index])
+
+  def _set_lift_start(self, position):
+    self.lift_start = position.clone()
+    self.lift_target = self.lift_start.clone()
+    vertical_axis = self.config.vertical_axis
+    self.lift_target[vertical_axis] = self.target_height
+    horizontal_axes = [axis for axis in range(3) if axis != vertical_axis]
+    for axis, value in zip(horizontal_axes, self.config.target_horizontal):
+      self.lift_target[axis] = value
+    self.previous_target = self.lift_start.clone()
+
+  def _constrain(self, positions, velocities, target, dt):
+    velocities[self.particle_index] = (target - self.previous_target) / dt
+    positions[self.particle_index] = target
+    self.previous_target = target.clone()
+
+  def _duration_reached(self, duration):
+    return self.phase_elapsed >= duration - 1e-12
 
 
 def fill_mesh_with_particles(
