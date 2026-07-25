@@ -63,7 +63,7 @@ class Scene(tl.HasTraits):
 
   def __init__(self, frame_start: int = 1, frame_end: int = 48, frame_rate: int = 24,
                step_rate: int = 240, resolution: Tuple[int, int] = (512, 512),
-               gravity: Tuple[float, float, float] = (0, 0, -10.),
+               gravity: Tuple[float, float, float] = (0, 0, -9.8),
                camera: Camera = UndefinedCamera(),
                ambient_illumination: color.Color = color.get_color("black"),
                background: color.Color = color.get_color("black")):

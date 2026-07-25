@@ -17,6 +17,9 @@
 import hashlib
 import logging
 import math
+import pathlib
+import shlex
+import sys
 
 import numpy as np
 
@@ -28,6 +31,11 @@ from kubric.simulator import SpringMassSimulator
 
 
 CAMERA_FOLLOW_EMA_ALPHA = 0.1
+IMAGE_FILE_TEMPLATES = {
+    "rgba": "image/rgba_{:05d}.png",
+    "depth": "depth/depth_{:05d}.tiff",
+    "segmentation": "segmentation/segmentation_{:05d}.png",
+}
 
 
 def _add_camera_follow_animation(camera, initial_look_at, vertex_animation):
@@ -115,6 +123,147 @@ def _get_camera_metadata(camera, look_at, resolution):
   }
 
 
+def _as_absolute_string(path):
+  path = str(path)
+  if path.startswith("gs://"):
+    return path
+  return str(pathlib.Path(path).resolve())
+
+
+def _get_run_metadata(flags):
+  argv = list(sys.argv)
+  return {
+      "argv": argv,
+      "command": " ".join(shlex.quote(arg) for arg in argv),
+      "flags": dict(vars(flags)),
+  }
+
+
+def _lift_phase_at_time(repeated_lift, time_seconds):
+  if repeated_lift is None:
+    return "none"
+  if time_seconds < repeated_lift.initial_settle_seconds:
+    return "initial_settle"
+
+  cycle_time = time_seconds - repeated_lift.initial_settle_seconds
+  cycle_duration = (
+      repeated_lift.lift_seconds
+      + repeated_lift.hold_seconds
+      + repeated_lift.settle_seconds)
+  if repeated_lift.repeat_count <= 0 or (
+      cycle_time >= repeated_lift.repeat_count * cycle_duration):
+    return "done"
+
+  phase_time = cycle_time % cycle_duration
+  if phase_time < repeated_lift.lift_seconds:
+    return "lift"
+  if phase_time < repeated_lift.lift_seconds + repeated_lift.hold_seconds:
+    return "hold"
+  return "settle"
+
+
+def _get_control_state_by_frame(repeated_lift, frame_indices, frame_rate):
+  frame_indices = np.asarray(frame_indices, dtype=np.int32)
+  phases = np.asarray([
+      _lift_phase_at_time(repeated_lift, frame / frame_rate)
+      for frame in frame_indices
+  ])
+  is_grasped = np.isin(phases, ["lift", "hold"])
+  return {
+      "frame_indices": frame_indices,
+      "phase": phases,
+      "is_grasped": is_grasped,
+      "grasped_frame_ranges": _get_true_ranges(frame_indices, is_grasped),
+  }
+
+
+def _get_true_ranges(frame_indices, mask):
+  ranges = []
+  start = None
+  previous = None
+  for frame, is_true in zip(frame_indices.tolist(), mask.tolist()):
+    if is_true and start is None:
+      start = frame
+    if not is_true and start is not None:
+      ranges.append([start, previous])
+      start = None
+    previous = frame
+  if start is not None:
+    ranges.append([start, previous])
+  return ranges
+
+
+def _get_processed_camera_view(camera, resolution, image_path):
+  """Returns the compact per-frame camera view metadata."""
+  width, height = resolution
+  camera_to_world = np.asarray(camera.matrix_world, dtype=np.float64)
+  world_to_camera_blender = np.linalg.inv(camera_to_world)
+  blender_to_opencv = np.diag([1., -1., -1., 1.])
+  world_to_camera_opencv = blender_to_opencv @ world_to_camera_blender
+  camera_to_world_opencv = np.linalg.inv(world_to_camera_opencv)
+
+  sensor_height = camera.sensor_width * height / width
+  focal_x_pixels = camera.focal_length * width / camera.sensor_width
+  focal_y_pixels = camera.focal_length * height / sensor_height
+  principal_x = width / 2.
+  principal_y = height / 2.
+
+  return {
+      "camera_index": None,
+      "image_path": image_path,
+      "fxfycxcy": [
+          float(focal_x_pixels),
+          float(focal_y_pixels),
+          float(principal_x),
+          float(principal_y),
+      ],
+      "w2c": world_to_camera_opencv.tolist(),
+      "c2w": camera_to_world_opencv.tolist(),
+  }
+
+
+def _write_processed_camera_metadata(
+    output_dir,
+    asset_id,
+    cameras,
+    resolution,
+    frame_start,
+    frame_end,
+    multi_camera,
+):
+  """Writes frame-major camera metadata in the metadata_processed.json format."""
+  frame_numbers = list(range(frame_start, frame_end + 1))
+  denom = max(1, len(frame_numbers) - 1)
+  frames = []
+  for frame_index, frame_number in enumerate(frame_numbers):
+    views = []
+    for camera_index, camera in enumerate(cameras):
+      camera_dir = (
+          output_dir if not multi_camera
+          else output_dir / f"camera_{camera_index:02d}")
+      image_path = _as_absolute_string(
+          camera_dir / IMAGE_FILE_TEMPLATES["rgba"].format(frame_index))
+      with camera.at_frame(frame_number):
+        view = _get_processed_camera_view(camera, resolution, image_path)
+      view["camera_index"] = camera_index
+      views.append(view)
+    frames.append({
+        "frame_index": frame_index,
+        "time_normalized": -1.0 + 2.0 * frame_index / denom,
+        "look_at_animation_index": frame_number,
+        "views": views,
+    })
+
+  kb.write_json({
+      "format": "svsm_dynamic_multiview_v1",
+      "scene_name": asset_id,
+      "num_frames": len(frame_numbers),
+      "num_cameras": len(cameras),
+      "camera_convention": "opencv: +X right, +Y down, +Z forward",
+      "frames": frames,
+  }, output_dir / "metadata_processed.json")
+
+
 parser = kb.ArgumentParser()
 parser.add_argument(
     "--gso_assets",
@@ -132,6 +281,16 @@ parser.add_argument("--control_target_y", type=float, default=0.0)
 parser.add_argument("--camera_count", type=int, default=4)
 parser.add_argument("--randomize_cameras", action="store_true")
 parser.add_argument("--camera_follow_obj", action="store_true")
+parser.add_argument("--render_depth", action="store_true")
+parser.add_argument("--render_segmentation", action="store_true")
+parser.add_argument(
+    "--motion_mode",
+    choices=["spring_mass", "free_fall"],
+    default="spring_mass",
+    help=(
+        "Motion preset: spring_mass enables repeated lift; free_fall "
+        "disables it and starts from rest."),
+)
 parser.add_argument("--repeat_count", type=int, default=5)
 parser.add_argument("--initial_settle_seconds", type=float, default=2.0)
 parser.add_argument("--lift_seconds", type=float, default=1.0)
@@ -157,12 +316,20 @@ fixed_camera_look_at = (0., 0., 1.)
 if not 1 <= FLAGS.camera_count <= len(fixed_camera_positions):
   raise ValueError(
       f"camera_count must be between 1 and {len(fixed_camera_positions)}")
-simulation_seconds = (
-    FLAGS.initial_settle_seconds + FLAGS.repeat_count * (
-        FLAGS.lift_seconds + FLAGS.hold_seconds + FLAGS.settle_seconds))
-FLAGS.frame_end = math.ceil(simulation_seconds * FLAGS.frame_rate)
+render_layers = ["rgba"]
+if FLAGS.render_depth:
+  render_layers.append("depth")
+if FLAGS.render_segmentation:
+  render_layers.append("segmentation")
+if FLAGS.motion_mode == "free_fall":
+  FLAGS.repeat_count = 0
+else:
+  simulation_seconds = (
+      FLAGS.initial_settle_seconds + FLAGS.repeat_count * (
+          FLAGS.lift_seconds + FLAGS.hold_seconds + FLAGS.settle_seconds))
+  FLAGS.frame_end = math.ceil(simulation_seconds * FLAGS.frame_rate)
 repeated_lift = None
-if FLAGS.repeat_count > 0:
+if FLAGS.motion_mode == "spring_mass" and FLAGS.repeat_count > 0:
   repeated_lift = RepeatedLiftConfig(
       control_vertex_index=FLAGS.control_vertex_index,
       repeat_count=FLAGS.repeat_count,
@@ -184,11 +351,14 @@ simulator = SpringMassSimulator(
         spring_stiffness=FLAGS.spring_stiffness,
         damping=FLAGS.damping,
         total_mass=1.0,
-        initial_velocity=(0.5, 0., 0.),
+        initial_velocity=(
+            (0., 0., 0.)
+            if FLAGS.motion_mode == "free_fall" else (0.5, 0., 0.)),
         ground_axis=2,
         ground_height=0.,
         restitution=0.2,
         friction=0.3,
+        record_all_particles=True,
         seed=FLAGS.seed,
     ),
     device="cuda",
@@ -211,7 +381,7 @@ with kb.AssetSource.from_manifest(FLAGS.gso_assets, scratch_dir) as gso:
   asset_id = str(FLAGS.asset_id or rng.choice(asset_ids))
   if asset_id not in gso._assets:  # pylint: disable=protected-access
     raise ValueError(f"Unknown GSO asset ID: {asset_id!r}")
-  asset_output_dir = output_dir / asset_id
+  asset_output_dir = output_dir
   asset_output_dir.mkdir(parents=True, exist_ok=True)
 
   if FLAGS.randomize_cameras:
@@ -272,6 +442,70 @@ with kb.AssetSource.from_manifest(FLAGS.gso_assets, scratch_dir) as gso:
       frame_end=scene.frame_end + 1,
       repeated_lift=repeated_lift,
   )
+  mesh_vertices_path = asset_output_dir / "mesh_vertices.npz"
+  mesh_frame_indices = np.arange(
+      vertex_animation.frame_start, vertex_animation.frame_end + 1,
+      dtype=np.int32)
+  mesh_control_state = _get_control_state_by_frame(
+      repeated_lift, mesh_frame_indices, scene.frame_rate)
+  np.savez_compressed(
+      str(mesh_vertices_path),
+      vertices_world=vertex_animation.vertices,
+      velocities_world=simulator.last_render_velocity_trajectory,
+      frame_indices=mesh_frame_indices,
+      rest_vertices_local=vertices.astype(np.float32),
+      faces=faces.astype(np.int32),
+      control_phase=mesh_control_state["phase"],
+      control_is_grasped=mesh_control_state["is_grasped"],
+  )
+  spring_mass_particles_path = asset_output_dir / "spring_mass_particles.npz"
+  np.savez_compressed(
+      str(spring_mass_particles_path),
+      particle_positions_world=simulator.last_particle_trajectory,
+      frame_indices=mesh_frame_indices,
+      initial_particle_positions_world=(
+          simulator.last_initial_particles.astype(np.float32)),
+      edges=simulator.last_edges.astype(np.int32),
+      edge_columns=np.asarray([
+          "source_particle_index", "target_particle_index"]),
+  )
+  render_frame_indices = np.arange(
+      scene.frame_start, scene.frame_end + 1, dtype=np.int32)
+  render_control_state = _get_control_state_by_frame(
+      repeated_lift, render_frame_indices, scene.frame_rate)
+  control_point_metadata = None
+  if repeated_lift is not None:
+    control_vertex_trajectory = (
+        vertex_animation.vertices[:, FLAGS.control_vertex_index, :])
+    control_particle_index = simulator.last_control_particle_index
+    control_point_metadata = {
+        "vertex_index": FLAGS.control_vertex_index,
+        "particle_index": control_particle_index,
+        "initial_vertex_position_world": (
+            control_vertex_trajectory[0].astype(np.float64).tolist()),
+        "initial_particle_position_world": (
+            simulator.last_initial_particles[control_particle_index]
+            .astype(np.float64).tolist()),
+        "target_xy": [FLAGS.control_target_x, FLAGS.control_target_y],
+        "frame_start": vertex_animation.frame_start,
+        "frame_end": vertex_animation.frame_end,
+        "mesh_frames": {
+            "frame_indices": mesh_control_state["frame_indices"].tolist(),
+            "phase": mesh_control_state["phase"].tolist(),
+            "is_grasped": mesh_control_state["is_grasped"].tolist(),
+            "grasped_frame_ranges": (
+                mesh_control_state["grasped_frame_ranges"]),
+        },
+        "rendered_frames": {
+            "frame_indices": render_control_state["frame_indices"].tolist(),
+            "phase": render_control_state["phase"].tolist(),
+            "is_grasped": render_control_state["is_grasped"].tolist(),
+            "grasped_frame_ranges": (
+                render_control_state["grasped_frame_ranges"]),
+        },
+        "trajectory_world": (
+            control_vertex_trajectory.astype(np.float64).tolist()),
+    }
   renderer.add_vertex_animation(obj, vertex_animation)
 
   camera_look_at_animations = [None] * len(cameras)
@@ -283,6 +517,40 @@ with kb.AssetSource.from_manifest(FLAGS.gso_assets, scratch_dir) as gso:
   logging.info(
       "Spring graph contains %d particles and %d edges",
       len(simulator.last_initial_particles), len(simulator.last_edges))
+  spring_edges = simulator.last_edges.astype(np.int32)
+  spring_rest_vectors = (
+      simulator.last_initial_particles[spring_edges[:, 1]] -
+      simulator.last_initial_particles[spring_edges[:, 0]])
+  spring_rest_lengths = np.linalg.norm(spring_rest_vectors, axis=1)
+  kb.write_json({
+      "format": "kubric_spring_mass_model_v1",
+      "asset_id": asset_id,
+      "coordinate_frame": "world",
+      "topology": "undirected_knn",
+      "k_neighbors": simulator.config.k_neighbors,
+      "num_particles": len(simulator.last_initial_particles),
+      "num_springs": len(spring_edges),
+      "particle_positions_world": (
+          simulator.last_initial_particles.astype(np.float64)),
+      "edges": spring_edges,
+      "edge_columns": ["source_particle_index", "target_particle_index"],
+      "rest_lengths": spring_rest_lengths.astype(np.float64),
+      "config": {
+          "particle_spacing": simulator.config.particle_spacing,
+          "surface_sample_spacing": simulator.config.surface_sample_spacing,
+          "weld_tolerance": simulator.config.weld_tolerance,
+          "spring_stiffness": simulator.config.spring_stiffness,
+          "damping": simulator.config.damping,
+          "total_mass": simulator.config.total_mass,
+          "initial_velocity": simulator.config.initial_velocity,
+          "ground_axis": simulator.config.ground_axis,
+          "ground_height": simulator.config.ground_height,
+          "restitution": simulator.config.restitution,
+          "friction": simulator.config.friction,
+          "require_watertight": simulator.config.require_watertight,
+          "seed": simulator.config.seed,
+      },
+  }, asset_output_dir / "spring_mass_metatada.json")
   renderer.save_state(asset_output_dir / "gso_spring_mass.blend")
   for camera_index, camera in enumerate(cameras):
     scene.camera = camera
@@ -293,8 +561,9 @@ with kb.AssetSource.from_manifest(FLAGS.gso_assets, scratch_dir) as gso:
     logging.info(
         "Rendering camera %d from %s to %s",
         camera_index, camera.position, camera_output_dir)
-    frames = renderer.render(return_layers=("rgba",))
-    kb.write_image_dict({"rgba": frames["rgba"]}, camera_output_dir)
+    frames = renderer.render(return_layers=render_layers)
+    kb.write_image_dict(
+        frames, camera_output_dir, file_templates=IMAGE_FILE_TEMPLATES)
   cameras_metadata = []
   for camera_index, camera in enumerate(cameras):
     look_at_animation = camera_look_at_animations[camera_index]
@@ -314,8 +583,22 @@ with kb.AssetSource.from_manifest(FLAGS.gso_assets, scratch_dir) as gso:
           "look_at_world": look_at_animation.tolist(),
       }
     cameras_metadata.append(camera_metadata)
+  _write_processed_camera_metadata(
+      output_dir=asset_output_dir,
+      asset_id=asset_id,
+      cameras=cameras,
+      resolution=scene.resolution,
+      frame_start=scene.frame_start,
+      frame_end=scene.frame_end,
+      multi_camera=len(cameras) > 1,
+  )
   kb.write_json({
       "asset_id": asset_id,
+      "run": _get_run_metadata(FLAGS),
+      "mesh_vertices_file": mesh_vertices_path.name,
+      "spring_mass_particles_file": spring_mass_particles_path.name,
+      "num_mesh_vertices": vertex_animation.num_vertices,
+      "num_mesh_faces": len(faces),
       "num_particles": len(simulator.last_initial_particles),
       "num_springs": len(simulator.last_edges),
       "control_vertex_index": (
@@ -324,6 +607,7 @@ with kb.AssetSource.from_manifest(FLAGS.gso_assets, scratch_dir) as gso:
       "control_target_xy": (
           None if repeated_lift is None
           else [FLAGS.control_target_x, FLAGS.control_target_y]),
+      "control_point": control_point_metadata,
       "randomize_cameras": FLAGS.randomize_cameras,
       "camera_follow_obj": FLAGS.camera_follow_obj,
       "camera_seed": camera_seed,

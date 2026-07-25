@@ -74,7 +74,7 @@ docker run --rm \
     --spring_stiffness=20 \
     --damping=0.01 \
     --step_rate=2400 \
-    --camera_count=4 \
+    --camera_count=1 \
     --randomize_cameras \
     --repeat_count=0 \
     --initial_settle_seconds=5.0 \
@@ -124,7 +124,9 @@ docker run --rm \
     --settle_seconds=2.0 \
     --seed=42 \
     --job-dir=/output/spring_mass_repeated_lift \
-    --scratch_dir=/tmp/kubric_spring_mass_repeated_lift
+    --scratch_dir=/tmp/kubric_spring_mass_repeated_lift \
+    --render_depth \
+    --render_segmentation
 ```
 
 総レンダリング時間は次の式から自動計算される。

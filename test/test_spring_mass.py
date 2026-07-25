@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 import kubric as kb
+from kubric.simulator.spring_mass import ControlTrajectoryConfig
 from kubric.simulator.spring_mass import fill_mesh_with_particles
 from kubric.simulator.spring_mass import RepeatedLiftConfig
 from kubric.simulator.spring_mass import SpringMassConfig
@@ -200,3 +201,60 @@ def test_spring_mass_rejects_out_of_range_control_vertex():
         TETRAHEDRON_FACES,
         repeated_lift=RepeatedLiftConfig(control_vertex_index=4),
     )
+
+
+def test_spring_mass_follows_control_trajectory():
+  pytest.importorskip("torch")
+  scene = kb.Scene(
+      frame_start=0,
+      frame_end=4,
+      frame_rate=10,
+      step_rate=100,
+      gravity=(0., 0., -5.),
+  )
+  asset = kb.FileBasedObject(
+      asset_id="controlled-trajectory-tetrahedron",
+      position=(0., 0., 0.),
+      mass=1.,
+      friction=0.,
+      restitution=0.,
+  )
+  simulator = SpringMassSimulator(
+      scene,
+      config=SpringMassConfig(
+          particle_spacing=0.3,
+          surface_sample_spacing=0.4,
+          k_neighbors=3,
+          spring_stiffness=20.,
+          damping=0.1,
+          ground_axis=2,
+          ground_height=0.,
+          max_particles=1000,
+          seed=3,
+      ),
+      device="cpu",
+  )
+  positions = np.asarray([
+      [0., 0., 0.],
+      [0., 0., 0.1],
+      [0., 0., 0.2],
+      [0., 0., 0.3],
+      [0., 0., 0.4],
+  ], dtype=np.float32)
+
+  animation = simulator.run(
+      asset,
+      TETRAHEDRON_VERTICES,
+      TETRAHEDRON_FACES,
+      control_trajectory=ControlTrajectoryConfig(
+          control_vertex_indices=(0,),
+          positions=positions,
+          frame_start=0,
+          frame_rate=scene.frame_rate,
+      ),
+  )
+
+  np.testing.assert_allclose(animation.vertices[:, 0], positions, atol=1e-5)
+  assert np.all(animation.vertices[:, :, 2] >= -1e-6)
+  assert simulator.last_control_particle_index == 0
+  np.testing.assert_array_equal(simulator.last_control_particle_indices, [0])

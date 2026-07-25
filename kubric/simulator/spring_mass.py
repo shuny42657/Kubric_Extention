@@ -47,6 +47,7 @@ class SpringMassConfig:
   total_mass: Optional[float] = None
   initial_velocity: Tuple[float, float, float] = (0., 0., 0.)
   surface_sample_spacing: Optional[float] = None
+  sampled_surface_particle_count: Optional[int] = None
   max_particles: int = 20000
   max_fill_candidates: int = 2000000
   weld_tolerance: Optional[float] = None
@@ -56,6 +57,11 @@ class SpringMassConfig:
   ground_height: float = 0.0
   restitution: Optional[float] = None
   friction: Optional[float] = None
+  control_mode: str = "hard"
+  control_attachment_k: int = 12
+  control_attachment_radius: Optional[float] = None
+  control_stiffness: float = 50.0
+  control_damping: float = 0.1
   require_watertight: bool = True
   record_all_particles: bool = False
   seed: int = 0
@@ -65,6 +71,9 @@ class SpringMassConfig:
       raise ValueError("particle_spacing must be positive")
     if self.surface_sample_spacing is not None and self.surface_sample_spacing <= 0:
       raise ValueError("surface_sample_spacing must be positive")
+    if (self.sampled_surface_particle_count is not None and
+        self.sampled_surface_particle_count <= 1):
+      raise ValueError("sampled_surface_particle_count must be greater than one")
     if self.k_neighbors <= 0:
       raise ValueError("k_neighbors must be positive")
     if self.spring_stiffness < 0 or self.damping < 0:
@@ -73,6 +82,10 @@ class SpringMassConfig:
       raise ValueError("total_mass must be positive")
     if self.max_particles <= 1:
       raise ValueError("max_particles must be greater than one")
+    if (self.sampled_surface_particle_count is not None and
+        self.sampled_surface_particle_count > self.max_particles):
+      raise ValueError(
+          "sampled_surface_particle_count cannot exceed max_particles")
     if self.max_fill_candidates <= 0:
       raise ValueError("max_fill_candidates must be positive")
     if self.weld_tolerance is not None and self.weld_tolerance <= 0:
@@ -87,6 +100,15 @@ class SpringMassConfig:
                         ("friction", self.friction)):
       if value is not None and not 0. <= value <= 1.:
         raise ValueError(f"{name} must be between zero and one")
+    if self.control_mode not in ("hard", "soft"):
+      raise ValueError("control_mode must be 'hard' or 'soft'")
+    if self.control_attachment_k <= 0:
+      raise ValueError("control_attachment_k must be positive")
+    if (self.control_attachment_radius is not None and
+        self.control_attachment_radius <= 0):
+      raise ValueError("control_attachment_radius must be positive")
+    if self.control_stiffness < 0 or self.control_damping < 0:
+      raise ValueError("control stiffness and damping cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -134,6 +156,68 @@ class RepeatedLiftConfig:
       raise ValueError("target_horizontal must contain two finite values")
 
 
+@dataclass(frozen=True)
+class ControlTrajectoryConfig:
+  """World-space kinematic constraints for one or more render vertices.
+
+  `positions` is sampled per frame and has shape `(num_frames, num_points, 3)`.
+  A shape of `(num_frames, 3)` is accepted for a single control point. Values
+  are linearly interpolated during substeps and clamped to the first/last sample
+  outside the provided frame range.
+  `active` optionally gates the constraint per frame and control point. Missing
+  values keep the legacy behavior where all controls remain active forever.
+  """
+
+  control_vertex_indices: Tuple[int, ...]
+  positions: np.ndarray
+  active: Optional[np.ndarray] = None
+  frame_start: int = 0
+  frame_rate: Optional[float] = None
+
+  def __post_init__(self):
+    indices = tuple(int(index) for index in self.control_vertex_indices)
+    if not indices:
+      raise ValueError("control_vertex_indices must not be empty")
+    if any(index < 0 for index in indices):
+      raise ValueError("control_vertex_indices cannot contain negatives")
+    if len(set(indices)) != len(indices):
+      raise ValueError("control_vertex_indices must be unique")
+
+    positions = np.asarray(self.positions, dtype=np.float32)
+    if positions.ndim == 2 and len(indices) == 1 and positions.shape[1] == 3:
+      positions = positions[:, None, :]
+    if positions.ndim != 3 or positions.shape[1:] != (len(indices), 3):
+      raise ValueError(
+          "positions must have shape (num_frames, num_points, 3), "
+          f"got {positions.shape}")
+    if positions.shape[0] == 0:
+      raise ValueError("positions must contain at least one frame")
+    if not np.all(np.isfinite(positions)):
+      raise ValueError("positions must be finite")
+    if self.frame_rate is not None and self.frame_rate <= 0:
+      raise ValueError("frame_rate must be positive")
+
+    if self.active is None:
+      active = np.ones(positions.shape[:2], dtype=np.bool_)
+    else:
+      active = np.asarray(self.active, dtype=np.bool_)
+      if active.ndim == 1:
+        active = np.repeat(active[:, None], len(indices), axis=1)
+      if active.shape != positions.shape[:2]:
+        raise ValueError(
+            "active must have shape (num_frames, num_points), "
+            f"got {active.shape}")
+
+    positions = np.array(positions, dtype=np.float32, copy=True)
+    positions.setflags(write=False)
+    active = np.array(active, dtype=np.bool_, copy=True)
+    active.setflags(write=False)
+    object.__setattr__(self, "control_vertex_indices", indices)
+    object.__setattr__(self, "positions", positions)
+    object.__setattr__(self, "active", active)
+    object.__setattr__(self, "frame_start", int(self.frame_start))
+
+
 class SpringMassSimulator:
   """Simulates a filled triangle mesh as particles connected by springs.
 
@@ -162,7 +246,11 @@ class SpringMassSimulator:
     self.last_initial_particles = None
     self.last_edges = None
     self.last_particle_trajectory = None
+    self.last_render_velocity_trajectory = None
+    self.last_surface_mapping = None
     self.last_control_particle_index = None
+    self.last_control_particle_indices = None
+    self.last_control_attachment_indices = None
 
   def run(
       self,
@@ -172,6 +260,10 @@ class SpringMassSimulator:
       frame_start: Optional[int] = None,
       frame_end: Optional[int] = None,
       repeated_lift: Optional[RepeatedLiftConfig] = None,
+      control_trajectory: Optional[ControlTrajectoryConfig] = None,
+      initial_particles_world: Optional[np.ndarray] = None,
+      surface_mapping: Optional[np.ndarray] = None,
+      edges: Optional[np.ndarray] = None,
   ) -> core.VertexAnimation:
     """Runs the simulation and returns world-space render-mesh vertices.
 
@@ -182,6 +274,10 @@ class SpringMassSimulator:
       frame_start: First recorded frame, inclusive.
       frame_end: Last recorded frame, inclusive.
       repeated_lift: Optional repeated lift-and-release schedule.
+      control_trajectory: Optional always-on world-space control trajectory.
+      initial_particles_world: Optional replay particle cloud in world space.
+      surface_mapping: Optional render-vertex to particle mapping for replay.
+      edges: Optional spring edges for replay.
     """
     if not isinstance(asset, core.PhysicalObject):
       raise TypeError("asset must be a PhysicalObject")
@@ -193,10 +289,40 @@ class SpringMassSimulator:
     frame_end = self.scene.frame_end if frame_end is None else frame_end
     if frame_end < frame_start:
       raise ValueError("frame_end must be greater than or equal to frame_start")
+    if repeated_lift is not None and control_trajectory is not None:
+      raise ValueError("Specify only one of repeated_lift or control_trajectory")
 
     world_vertices = _to_world_vertices(asset, vertices)
-    particles, surface_mapping = _prepare_particle_cloud(
-        world_vertices, faces, self.config)
+    replay_inputs = (initial_particles_world, surface_mapping, edges)
+    preserve_render_vertex_indices = None
+    if repeated_lift is not None:
+      preserve_render_vertex_indices = [repeated_lift.control_vertex_index]
+    elif control_trajectory is not None:
+      preserve_render_vertex_indices = list(
+          control_trajectory.control_vertex_indices)
+
+    if any(value is not None for value in replay_inputs):
+      if not all(value is not None for value in replay_inputs):
+        raise ValueError(
+            "initial_particles_world, surface_mapping, and edges must be "
+            "provided together")
+      particles = np.asarray(initial_particles_world, dtype=np.float32)
+      surface_mapping = np.asarray(surface_mapping, dtype=np.int64)
+      edges = np.asarray(edges, dtype=np.int64)
+      if particles.ndim != 2 or particles.shape[1] != 3:
+        raise ValueError("initial_particles_world must have shape (N, 3)")
+      if surface_mapping.shape != (len(vertices),):
+        raise ValueError("surface_mapping must have shape (num_vertices,)")
+      if (surface_mapping.min() < 0 or
+          surface_mapping.max() >= len(particles)):
+        raise ValueError("surface_mapping contains out-of-range particle ids")
+      if edges.ndim != 2 or edges.shape[1] != 2:
+        raise ValueError("edges must have shape (E, 2)")
+      if edges.min() < 0 or edges.max() >= len(particles):
+        raise ValueError("edges contain out-of-range particle ids")
+    else:
+      particles, surface_mapping = _prepare_particle_cloud(
+          world_vertices, faces, self.config, preserve_render_vertex_indices)
     if len(particles) <= self.config.k_neighbors:
       raise ValueError(
           f"Need more than {self.config.k_neighbors} particles, got {len(particles)}")
@@ -206,8 +332,11 @@ class SpringMassSimulator:
     velocities = torch.zeros_like(positions)
     velocities += torch.as_tensor(
         self.config.initial_velocity, dtype=torch.float32, device=self.device)
-    edges = _build_knn_edges(
-        positions, self.config.k_neighbors, self.config.knn_chunk_size)
+    if edges is None:
+      edges = _build_knn_edges(
+          positions, self.config.k_neighbors, self.config.knn_chunk_size)
+    else:
+      edges = torch.as_tensor(edges, dtype=torch.long, device=self.device)
     rest_vectors = positions[edges[:, 1]] - positions[edges[:, 0]]
     rest_lengths = torch.linalg.vector_norm(rest_vectors, dim=1)
     valid_edges = rest_lengths > 1e-8
@@ -229,7 +358,10 @@ class SpringMassSimulator:
     friction = asset.friction if self.config.friction is None else self.config.friction
 
     lift_controller = None
+    soft_controller = None
     self.last_control_particle_index = None
+    self.last_control_particle_indices = None
+    self.last_control_attachment_indices = None
     if repeated_lift is not None:
       if repeated_lift.control_vertex_index >= len(vertices):
         raise ValueError(
@@ -242,26 +374,75 @@ class SpringMassSimulator:
           initial_position=positions[control_particle_index].clone(),
       )
       self.last_control_particle_index = control_particle_index
+      self.last_control_particle_indices = np.asarray(
+          [control_particle_index], dtype=np.int32)
+    elif control_trajectory is not None:
+      if max(control_trajectory.control_vertex_indices) >= len(vertices):
+        raise ValueError(
+            "control_vertex_indices contains an index outside the render mesh "
+            "vertex range")
+      control_particle_indices = np.asarray([
+          int(surface_mapping[vertex_index])
+          for vertex_index in control_trajectory.control_vertex_indices
+      ], dtype=np.int64)
+      if self.config.control_mode == "soft":
+        soft_controller = _SoftControlTrajectoryController(
+            config=control_trajectory,
+            center_particle_indices=control_particle_indices,
+            initial_positions=positions,
+            device=self.device,
+            scene_frame_rate=self.scene.frame_rate,
+            simulation_frame_start=frame_start,
+            attachment_k=self.config.control_attachment_k,
+            attachment_radius=self.config.control_attachment_radius,
+            stiffness=self.config.control_stiffness,
+            damping=self.config.control_damping,
+        )
+        self.last_control_attachment_indices = (
+            soft_controller.attachment_indices.detach().cpu().numpy().astype(
+                np.int32))
+      else:
+        lift_controller = _ControlTrajectoryController(
+            config=control_trajectory,
+            particle_indices=control_particle_indices,
+            device=self.device,
+            scene_frame_rate=self.scene.frame_rate,
+            simulation_frame_start=frame_start,
+        )
+      self.last_control_particle_index = int(control_particle_indices[0])
+      self.last_control_particle_indices = control_particle_indices.astype(
+          np.int32)
 
     render_trajectory = []
+    render_velocity_trajectory = []
     particle_trajectory = [] if self.config.record_all_particles else None
     surface_mapping_tensor = torch.as_tensor(
         surface_mapping, dtype=torch.long, device=self.device)
     initial_surface_particles = positions[surface_mapping_tensor].clone()
     original_surface_vertices = torch.as_tensor(
         world_vertices, dtype=torch.float32, device=self.device)
+    if (lift_controller is not None and
+        isinstance(lift_controller, _ControlTrajectoryController)):
+      lift_controller.apply_initial(positions, velocities)
     with torch.no_grad():
       for frame in range(frame_start, frame_end + 1):
         surface_displacement = (
             positions[surface_mapping_tensor] - initial_surface_particles)
         render_positions = original_surface_vertices + surface_displacement
+        render_velocities = velocities[surface_mapping_tensor]
         render_trajectory.append(render_positions.detach().cpu().numpy().copy())
+        render_velocity_trajectory.append(
+            render_velocities.detach().cpu().numpy().copy())
         if particle_trajectory is not None:
           particle_trajectory.append(positions.detach().cpu().numpy().copy())
         if frame == frame_end:
           break
 
         for _ in range(steps_per_frame):
+          extra_forces = None
+          if soft_controller is not None:
+            extra_forces = soft_controller.compute_forces(
+                positions, velocities, dt)
           positions, velocities = _integrate_step(
               positions=positions,
               velocities=velocities,
@@ -272,12 +453,15 @@ class SpringMassSimulator:
               damping=self.config.damping,
               gravity=gravity,
               dt=dt,
+              extra_forces=extra_forces,
           )
           _apply_ground_collision(
               positions, velocities, self.config.ground_axis,
               self.config.ground_height, restitution, friction)
           if lift_controller is not None:
             lift_controller.advance(positions, velocities, dt)
+          if soft_controller is not None:
+            soft_controller.advance(dt)
 
         if not torch.isfinite(positions).all():
           raise RuntimeError(
@@ -286,9 +470,12 @@ class SpringMassSimulator:
 
     self.last_initial_particles = particles.copy()
     self.last_edges = edges.detach().cpu().numpy()
+    self.last_surface_mapping = surface_mapping.copy()
     self.last_particle_trajectory = (
         None if particle_trajectory is None
         else np.stack(particle_trajectory).astype(np.float32))
+    self.last_render_velocity_trajectory = (
+        np.stack(render_velocity_trajectory).astype(np.float32))
 
     logger.info(
         "Simulated %s with %d surface vertices, %d particles, and %d springs on %s",
@@ -389,6 +576,181 @@ class _RepeatedLiftController:
     return self.phase_elapsed >= duration - 1e-12
 
 
+class _ControlTrajectoryController:
+  """Applies always-on kinematic constraints from sampled world positions."""
+
+  def __init__(
+      self,
+      config,
+      particle_indices,
+      device,
+      scene_frame_rate,
+      simulation_frame_start,
+  ):
+    self.config = config
+    self.particle_indices = torch.as_tensor(
+        particle_indices, dtype=torch.long, device=device)
+    self.positions = torch.as_tensor(
+        config.positions, dtype=torch.float32, device=device)
+    self.active = torch.as_tensor(
+        config.active, dtype=torch.bool, device=device)
+    self.frame_rate = (
+        float(scene_frame_rate) if config.frame_rate is None
+        else float(config.frame_rate))
+    self.time_seconds = float(simulation_frame_start) / float(scene_frame_rate)
+    self.previous_target = None
+
+  def apply_initial(self, positions, velocities):
+    active = self._active_at_current_time()
+    if not torch.any(active):
+      self.previous_target = None
+      return
+    target = self._target_at_current_time()
+    positions[self.particle_indices[active]] = target[active]
+    velocities[self.particle_indices[active]].zero_()
+    self.previous_target = target.clone()
+
+  def advance(self, positions, velocities, dt):
+    self.time_seconds += dt
+    active = self._active_at_current_time()
+    if not torch.any(active):
+      self.previous_target = None
+      return
+    target = self._target_at_current_time()
+    if self.previous_target is None:
+      velocities[self.particle_indices[active]].zero_()
+    else:
+      velocities[self.particle_indices[active]] = (
+          target[active] - self.previous_target[active]) / dt
+    positions[self.particle_indices[active]] = target[active]
+    self.previous_target = target.clone()
+
+  def _sample_indices_and_weight(self):
+    sample_position = (
+        self.time_seconds * self.frame_rate - float(self.config.frame_start))
+    max_index = self.positions.shape[0] - 1
+    clamped = min(max(sample_position, 0.0), float(max_index))
+    lower_index = int(np.floor(clamped))
+    upper_index = min(lower_index + 1, max_index)
+    return lower_index, upper_index, clamped - lower_index
+
+  def _active_at_current_time(self):
+    lower_index, _, _ = self._sample_indices_and_weight()
+    return self.active[lower_index]
+
+  def _target_at_current_time(self):
+    lower_index, upper_index, weight = self._sample_indices_and_weight()
+    if upper_index == lower_index:
+      return self.positions[lower_index]
+    return (
+        self.positions[lower_index] * (1.0 - weight) +
+        self.positions[upper_index] * weight)
+
+
+class _SoftControlTrajectoryController:
+  """Pulls local particle patches toward moving virtual control anchors."""
+
+  def __init__(
+      self,
+      config,
+      center_particle_indices,
+      initial_positions,
+      device,
+      scene_frame_rate,
+      simulation_frame_start,
+      attachment_k,
+      attachment_radius,
+      stiffness,
+      damping,
+  ):
+    self.config = config
+    self.positions = torch.as_tensor(
+        config.positions, dtype=torch.float32, device=device)
+    self.active = torch.as_tensor(
+        config.active, dtype=torch.bool, device=device)
+    self.frame_rate = (
+        float(scene_frame_rate) if config.frame_rate is None
+        else float(config.frame_rate))
+    self.time_seconds = float(simulation_frame_start) / float(scene_frame_rate)
+    self.stiffness = float(stiffness)
+    self.damping = float(damping)
+    self.previous_targets = self._target_at_current_time().clone()
+
+    center_particle_indices = torch.as_tensor(
+        center_particle_indices, dtype=torch.long, device=device)
+    attachment_rows = []
+    offset_rows = []
+    initial_anchor_positions = initial_positions[center_particle_indices]
+    for center_particle_index, anchor_position in zip(
+        center_particle_indices.tolist(), initial_anchor_positions):
+      distances = torch.linalg.vector_norm(
+          initial_positions - initial_positions[center_particle_index], dim=1)
+      order = torch.argsort(distances)
+      if attachment_radius is not None:
+        within_radius = order[distances[order] <= float(attachment_radius)]
+        if len(within_radius) >= attachment_k:
+          order = within_radius
+      selected = order[:attachment_k]
+      if not torch.any(selected == center_particle_index):
+        selected = torch.cat([
+            torch.as_tensor([center_particle_index], dtype=torch.long, device=device),
+            selected[:-1],
+        ])
+      attachment_rows.append(selected)
+      offset_rows.append(initial_positions[selected] - anchor_position)
+
+    self.attachment_indices = torch.stack(attachment_rows, dim=0)
+    self.initial_offsets = torch.stack(offset_rows, dim=0)
+
+  def compute_forces(self, positions, velocities, dt):
+    active = self._active_at_current_time()
+    if not torch.any(active):
+      self.previous_targets = self._target_at_current_time().clone()
+      return torch.zeros_like(positions)
+    target = self._target_at_current_time()
+    target_velocity = (target - self.previous_targets) / dt
+    particle_targets = target[:, None, :] + self.initial_offsets
+    attached_positions = positions[self.attachment_indices]
+    attached_velocities = velocities[self.attachment_indices]
+    attached_target_velocities = target_velocity[:, None, :].expand_as(
+        attached_velocities)
+    attachment_forces = (
+        self.stiffness * (particle_targets - attached_positions) +
+        self.damping * (attached_target_velocities - attached_velocities))
+    attachment_forces = attachment_forces * active[:, None, None]
+    forces = torch.zeros_like(positions)
+    forces.index_add_(
+        0,
+        self.attachment_indices.reshape(-1),
+        attachment_forces.reshape(-1, 3))
+    self.previous_targets = target.clone()
+    return forces
+
+  def advance(self, dt):
+    self.time_seconds += dt
+
+  def _target_at_current_time(self):
+    lower_index, upper_index, weight = self._sample_indices_and_weight()
+    if upper_index == lower_index:
+      return self.positions[lower_index]
+    return (
+        self.positions[lower_index] * (1.0 - weight) +
+        self.positions[upper_index] * weight)
+
+  def _active_at_current_time(self):
+    lower_index, _, _ = self._sample_indices_and_weight()
+    return self.active[lower_index]
+
+  def _sample_indices_and_weight(self):
+    sample_position = (
+        self.time_seconds * self.frame_rate - float(self.config.frame_start))
+    max_index = self.positions.shape[0] - 1
+    clamped = min(max(sample_position, 0.0), float(max_index))
+    lower_index = int(np.floor(clamped))
+    upper_index = min(lower_index + 1, max_index)
+    return lower_index, upper_index, clamped - lower_index
+
+
 def fill_mesh_with_particles(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -399,7 +761,7 @@ def fill_mesh_with_particles(
   return particles
 
 
-def _prepare_particle_cloud(vertices, faces, config):
+def _prepare_particle_cloud(vertices, faces, config, preserve_render_vertex_indices=None):
   vertices, faces = _validate_mesh(vertices, faces)
   weld_tolerance = config.weld_tolerance or config.particle_spacing * 1e-4
   volume_vertices, volume_faces, surface_mapping = _weld_mesh(
@@ -408,6 +770,32 @@ def _prepare_particle_cloud(vertices, faces, config):
     raise ValueError("Cannot fill a non-watertight mesh")
 
   rng = np.random.default_rng(config.seed)
+  if config.sampled_surface_particle_count is not None:
+    preserve_welded_indices = None
+    if preserve_render_vertex_indices is not None:
+      preserve_render_vertex_indices = np.asarray(
+          preserve_render_vertex_indices, dtype=np.int64)
+      if (preserve_render_vertex_indices.size and
+          (preserve_render_vertex_indices.min() < 0 or
+           preserve_render_vertex_indices.max() >= len(vertices))):
+        raise ValueError("preserve_render_vertex_indices contains out-of-range ids")
+      preserve_welded_indices = surface_mapping[preserve_render_vertex_indices]
+    selected_indices = _sample_surface_vertices_farthest(
+        volume_vertices,
+        config.sampled_surface_particle_count,
+        rng,
+        preserve_welded_indices)
+    particles = volume_vertices[selected_indices].astype(np.float32)
+    sampled_surface_mapping = _nearest_point_indices_chunked(
+        volume_vertices[surface_mapping],
+        particles,
+        config.knn_chunk_size).astype(np.int64)
+    if len(particles) > config.max_particles:
+      raise ValueError(
+          f"Sampled surface generated {len(particles)} particles, exceeding "
+          f"max_particles={config.max_particles}")
+    return particles, sampled_surface_mapping
+
   surface_spacing = config.surface_sample_spacing or config.particle_spacing
   available_samples = config.max_particles - len(volume_vertices)
   if available_samples <= 0:
@@ -447,6 +835,52 @@ def _prepare_particle_cloud(vertices, faces, config):
         f"Mesh filling generated {len(particles)} particles, exceeding "
         f"max_particles={config.max_particles}; increase particle_spacing")
   return particles.astype(np.float32), surface_mapping
+
+
+def _sample_surface_vertices_farthest(points, sample_count, rng, preserve_indices=None):
+  points = np.asarray(points, dtype=np.float64)
+  sample_count = min(int(sample_count), len(points))
+  if preserve_indices is None:
+    selected = []
+  else:
+    selected = []
+    for index in np.asarray(preserve_indices, dtype=np.int64).tolist():
+      if index not in selected:
+        selected.append(index)
+  if len(selected) > sample_count:
+    raise ValueError(
+        "sampled_surface_particle_count is smaller than the number of "
+        "preserved control particles")
+
+  if not selected:
+    center = np.mean(points, axis=0)
+    selected.append(int(np.argmin(np.sum((points - center[None, :]) ** 2, axis=1))))
+
+  min_distances = np.full(len(points), np.inf, dtype=np.float64)
+  for index in selected:
+    distances = np.sum((points - points[index][None, :]) ** 2, axis=1)
+    min_distances = np.minimum(min_distances, distances)
+  min_distances[selected] = -np.inf
+
+  while len(selected) < sample_count:
+    next_index = int(np.argmax(min_distances))
+    selected.append(next_index)
+    distances = np.sum((points - points[next_index][None, :]) ** 2, axis=1)
+    min_distances = np.minimum(min_distances, distances)
+    min_distances[selected] = -np.inf
+  return np.asarray(selected, dtype=np.int64)
+
+
+def _nearest_point_indices_chunked(query_points, reference_points, chunk_size):
+  query_points = np.asarray(query_points, dtype=np.float32)
+  reference_points = np.asarray(reference_points, dtype=np.float32)
+  nearest = np.empty(len(query_points), dtype=np.int64)
+  for start in range(0, len(query_points), chunk_size):
+    end = min(start + chunk_size, len(query_points))
+    delta = query_points[start:end, None, :] - reference_points[None, :, :]
+    distances = np.sum(delta * delta, axis=2)
+    nearest[start:end] = np.argmin(distances, axis=1)
+  return nearest
 
 
 def _validate_mesh(vertices, faces):
@@ -596,6 +1030,7 @@ def _integrate_step(
     damping,
     gravity,
     dt,
+    extra_forces=None,
 ):
   source, target = edges[:, 0], edges[:, 1]
   delta = positions[target] - positions[source]
@@ -609,6 +1044,8 @@ def _integrate_step(
 
   forces = gravity.unsqueeze(0).expand_as(positions) * particle_mass
   forces = forces.clone()
+  if extra_forces is not None:
+    forces = forces + extra_forces
   forces.index_add_(0, source, edge_forces)
   forces.index_add_(0, target, -edge_forces)
   velocities = velocities + forces * (dt / particle_mass)

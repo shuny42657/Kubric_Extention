@@ -75,6 +75,8 @@ for asset_id in "${asset_ids[@]}"; do
         --control_target_y=0 \
         --camera_count=4 \
         --randomize_cameras \
+        --render_depth \
+        --render_segmentation \
         --repeat_count=5 \
         --initial_settle_seconds=2.0 \
         --lift_seconds=1.0 \
