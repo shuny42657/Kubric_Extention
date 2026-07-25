@@ -73,6 +73,8 @@ class _NumpyEncoder(json.JSONEncoder):
   def default(self, o):
     if isinstance(o, np.ndarray):
       return o.tolist()
+    if isinstance(o, np.generic):
+      return o.item()
     return json.JSONEncoder.default(self, o)
 
 
@@ -193,6 +195,7 @@ def write_tiff(data: np.ndarray, filename: PathLike):
 
   img_as_bytes = imageio.imwrite("<bytes>", data, format="tiff")
   filename = as_path(filename)
+  filename.parent.mkdir(parents=True, exist_ok=True)
   filename.write_bytes(img_as_bytes)
 
 
@@ -218,8 +221,12 @@ def multi_write_image(data: np.ndarray, path_template: str, write_fn=write_png,
     **kwargs: additional kwargs to pass to the write_fn.
   """
   num_threads = min(data.shape[0], max_write_threads)
+  paths = [as_path(path_template.format(i)) for i in range(data.shape[0])]
+  for parent in {path.parent for path in paths}:
+    parent.mkdir(parents=True, exist_ok=True)
+
   with multiprocessing.pool.ThreadPool(num_threads) as pool:
-    args = [(img, path_template.format(i)) for i, img in enumerate(data)]
+    args = list(zip(data, paths))
 
     def write_single_image_fn(arg):
       write_fn(*arg, **kwargs)

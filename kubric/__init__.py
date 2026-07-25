@@ -51,6 +51,7 @@ from kubric.core.objects import PhysicalObject
 from kubric.core.objects import Sphere
 from kubric.core.objects import Cube
 from kubric.core.objects import FileBasedObject
+from kubric.core.animation import VertexAnimation
 
 from kubric.kubric_typing import AddAssetFunction
 from kubric.kubric_typing import PathLike
